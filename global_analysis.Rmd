@@ -1,0 +1,460 @@
+---
+title: "Part I Global functional analysis "
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    fig_caption: true
+    self_contained: true
+    theme: readable
+    df_print: paged
+fontsize: 11pt
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE, fig.width = 7, fig.height = 4.5)
+```
+
+# Packages & connection
+
+```{r pkgs}
+req <- c("DBI","RSQLite","dplyr","tidyr","ggplot2","tibble","stringr","vegan","ggrepel","readr","gridExtra")
+missing <- setdiff(req, rownames(installed.packages()))
+if (length(missing)) stop("missing: ", paste(missing, collapse=", "))
+invisible(lapply(req, library, character.only = TRUE))
+```
+
+```{r connect}
+DB_PATH <- "rachel_test.db"
+if (!file.exists(DB_PATH)) stop("Base not found: ", DB_PATH)
+con <- DBI::dbConnect(RSQLite::SQLite(), DB_PATH)
+```
+
+# Utilities (tests and effect sizes without extra dependencies)
+
+```{r utils}
+
+cliffs_delta <- function(x, y){
+  x <- x[is.finite(x)]; y <- y[is.finite(y)]
+  nx <- length(x); ny <- length(y)
+  if (nx==0 || ny==0) return(list(delta=NA_real_, magnitude="NA"))
+  xy <- outer(x, y, function(a,b) sign(a-b))
+  delta <- sum(xy) / (nx*ny)
+  mag <- ifelse(abs(delta) < 0.147, "negligible",
+         ifelse(abs(delta) < 0.33,  "small",
+         ifelse(abs(delta) < 0.474, "medium", "large")))
+  list(delta=delta, magnitude=mag)
+}
+
+rank_biserial_paired <- function(before, after){
+  d <- after - before
+  d <- d[is.finite(d) & d != 0]
+  n_pos <- sum(d > 0); n_neg <- sum(d < 0)
+  if ((n_pos + n_neg) == 0) return(list(r=NA_real_, magnitude="NA"))
+  r <- (n_pos - n_neg) / (n_pos + n_neg)
+  mag <- ifelse(abs(r) < 0.147, "negligible",
+         ifelse(abs(r) < 0.33,  "small",
+         ifelse(abs(r) < 0.474, "medium", "large")))
+  list(r=r, magnitude=mag)
+}
+
+paired_wilcox <- function(df, value_col, condition_col="condition", id_col="cow_id"){
+
+  if (!all(c(condition_col, value_col) %in% names(df))) {
+    wt <- list(statistic = NA_real_, p.value = NA_real_)
+    eff <- list(delta = NA_real_, magnitude = "NA", r = NA_real_)
+    return(list(test=wt, effect=eff, paired_used=FALSE))
+  }
+  d <- df %>%
+    dplyr::filter(.data[[condition_col]] %in% c("before","after")) %>%
+    dplyr::filter(!is.na(.data[[condition_col]]), !is.na(.data[[value_col]]))
+
+
+  if (id_col %in% names(d)) {
+    pairs_ok <- d %>% dplyr::filter(!is.na(.data[[id_col]])) %>%
+      dplyr::add_count(.data[[id_col]]) %>% dplyr::filter(n==2) %>%
+      dplyr::pull(.data[[id_col]]) %>% unique()
+
+    if (length(pairs_ok) >= 2) {
+      wide <- d %>% dplyr::filter(.data[[id_col]] %in% pairs_ok) %>%
+        dplyr::select(dplyr::all_of(c(id_col, condition_col, value_col))) %>%
+        tidyr::pivot_wider(names_from = dplyr::all_of(condition_col),
+                           values_from = dplyr::all_of(value_col))
+      wide <- wide %>% dplyr::filter(!is.na(before), !is.na(after))
+      if (nrow(wide) >= 2) {
+        wt <- stats::wilcox.test(wide$before, wide$after, paired = TRUE, exact = FALSE)
+        eff <- rank_biserial_paired(wide$before, wide$after)
+        return(list(test=wt, effect=eff, paired_used=TRUE))
+      }
+    }
+  }
+
+
+  g1 <- d %>% dplyr::filter(.data[[condition_col]]=="before") %>% dplyr::pull(dplyr::all_of(value_col))
+  g2 <- d %>% dplyr::filter(.data[[condition_col]]=="after")  %>% dplyr::pull(dplyr::all_of(value_col))
+  g1 <- g1[is.finite(g1)]; g2 <- g2[is.finite(g2)]
+  if (length(g1) >= 1 && length(g2) >= 1) {
+    wt <- stats::wilcox.test(g1, g2, exact = FALSE)
+    eff <- cliffs_delta(g1, g2)
+    return(list(test=wt, effect=eff, paired_used=FALSE))
+  }
+
+
+  wt <- list(statistic = NA_real_, p.value = NA_real_)
+  eff <- list(delta = NA_real_, magnitude = "NA", r = NA_real_)
+  list(test=wt, effect=eff, paired_used=FALSE)
+}
+
+nice_p <- function(p) ifelse(is.na(p), "NA", formatC(p, format="e", digits=2))
+```
+
+# Metadata
+
+```{r meta}
+samples <- dbGetQuery(con, "SELECT id AS sample_id, sample_name FROM sample") %>%
+  dplyr::mutate(
+    condition = dplyr::case_when(
+      sample_name %in% paste0("A", 13:18) ~ "before",
+      sample_name %in% paste0("A", 19:24) ~ "after",
+      TRUE ~ NA_character_
+    ),
+    cow_id = dplyr::case_when(
+      sample_name %in% c("A13","A19") ~ "v1",
+      sample_name %in% c("A14","A20") ~ "v2",
+      sample_name %in% c("A15","A21") ~ "v3",
+      sample_name %in% c("A16","A22") ~ "v4",
+      sample_name %in% c("A17","A23") ~ "v5",
+      sample_name %in% c("A18","A24") ~ "v6",
+      TRUE ~ NA_character_
+    )
+  )
+```
+
+# Global pathway filter (reused everywhere)
+
+```{r maps-filter}
+
+selected_maps <- c(
+
+  "00010","00020","00030","00040",
+  "00051","00052","00500","00520",
+  "00562","00563",
+  "00620","00630","00640","00650",
+  "00660","00680","00720",
+  "00910","00920",
+
+
+  "00061","00071","00072","00561","00564",
+  "01040","01053",
+
+
+  "00220","00250","00260","00270","00280","00310",
+  "00330","00340","00350",
+
+
+  "00230","00240",
+  "00740","00750",
+
+
+  "00760","00770","00780",
+  "00130","00140",
+
+
+  "02010","02060","03070"
+)
+
+
+
+pathways_info <- dbGetQuery(con, "
+  SELECT id AS map_id, map_number, pathway_total_orthologs
+  FROM map
+  WHERE pathway_total_orthologs IS NOT NULL
+") %>%
+  dplyr::filter(pathway_total_orthologs > 0) %>%
+  dplyr::mutate(
+    map_number = as.character(map_number),
+    map_number = gsub('^map', '', map_number, ignore.case = TRUE),
+    map_number = stringr::str_pad(map_number, width = 5, pad = '0')
+  ) %>%
+  dplyr::filter(map_number %in% selected_maps)
+
+message(sprintf("Kept maps: %d (%s)",
+                dplyr::n_distinct(pathways_info$map_number),
+                paste(sort(unique(pathways_info$map_number)), collapse=", ")))
+```
+
+# 1. KO richness
+
+```{r ko}
+ko_edges <- dbGetQuery(con, "
+  SELECT bin.sample_id, bin.bin_name, bin_extra_kegg.kegg_id
+  FROM bin_extra_kegg
+  JOIN bin_extra ON bin_extra_kegg.extra_id = bin_extra.id
+  JOIN bin ON bin_extra.bin_id = bin.id
+")
+
+ko_richness_bin <- ko_edges %>%
+  dplyr::distinct(sample_id, bin_name, kegg_id) %>%
+  dplyr::count(sample_id, bin_name, name = 'n_unique_kos') %>%
+  dplyr::left_join(samples, by = 'sample_id') %>%
+  dplyr::filter(!is.na(condition))
+
+ko_richness_sample <- ko_edges %>%
+  dplyr::distinct(sample_id, kegg_id) %>%
+  dplyr::count(sample_id, name = 'n_unique_kos') %>%
+  dplyr::left_join(samples, by = 'sample_id') %>%
+  dplyr::filter(!is.na(condition))
+```
+
+```{r ko-desc}
+desc_bin <- ko_richness_bin %>% dplyr::group_by(condition) %>% dplyr::summarise(n=dplyr::n(), mean=mean(n_unique_kos), median=median(n_unique_kos), sd=sd(n_unique_kos), .groups='drop')
+desc_sam <- ko_richness_sample %>% dplyr::group_by(condition) %>% dplyr::summarise(n=dplyr::n(), mean=mean(n_unique_kos), median=median(n_unique_kos), sd=sd(n_unique_kos), .groups='drop')
+knitr::kable(desc_bin, caption="KO richness per bin")
+knitr::kable(desc_sam, caption="KO richness per sample ")
+```
+
+```{r ko-plot, fig.cap="KO richness — bin (left) and sample (right)"}
+p1 <- ggplot(ko_richness_bin, aes(factor(condition, levels=c('before','after')), n_unique_kos, fill=condition)) +
+  geom_boxplot(outlier.shape=NA, alpha=.85) + geom_jitter(width=.15, alpha=.6, size=1.8) +
+  scale_fill_manual(values=c(before='#91c3e6', after='#f4a582')) + labs(x="", y="Unique KOs per bin")
+p2 <- ggplot(ko_richness_sample, aes(factor(condition, levels=c('before','after')), n_unique_kos, fill=condition)) +
+  geom_boxplot(outlier.shape=NA, alpha=.85) + geom_jitter(width=.15, alpha=.6, size=2) +
+  scale_fill_manual(values=c(before='#91c3e6', after='#f4a582')) + labs(x="", y="Unique KOs per sample")
+gridExtra::grid.arrange(p1, p2, ncol=2)
+```
+
+```{r ko-tests}
+unpaired <- stats::wilcox.test(n_unique_kos ~ condition, data = ko_richness_bin, exact = FALSE)
+paired   <- paired_wilcox(ko_richness_sample, "n_unique_kos")
+
+knitr::kable(tibble::tibble(
+  Metric = c("KO/bin","KO/sample"),
+  Test = c("Wilcoxon (unpaired)", ifelse(paired$paired_used,"Wilcoxon (paired)","Wilcoxon (unpaired)")),
+  W = c(as.numeric(unpaired$statistic), as.numeric(paired$test$statistic)),
+  p_value = c(nice_p(unpaired$p.value), nice_p(paired$test$p.value)),
+  Effect = c(round(cliffs_delta(ko_richness_bin$n_unique_kos[ko_richness_bin$condition=='before'],
+                                ko_richness_bin$n_unique_kos[ko_richness_bin$condition=='after'])$delta,3),
+             ifelse(paired$paired_used, round(paired$effect$r,3), NA)),
+  Magnitude = c(cliffs_delta(ko_richness_bin$n_unique_kos[ko_richness_bin$condition=='before'],
+                              ko_richness_bin$n_unique_kos[ko_richness_bin$condition=='after'])$magnitude,
+                ifelse(paired$paired_used, paired$effect$magnitude, "NA"))
+), caption="KO richness — tests")
+```
+
+# 2. Coverage (detected pathways)
+
+```{r cov}
+ko_map_edges <- dbGetQuery(con, "
+  SELECT bin.sample_id, bin.bin_name, map_kegg.map_id, bin_extra_kegg.kegg_id
+  FROM bin_extra_kegg
+  JOIN bin_extra ON bin_extra_kegg.extra_id = bin_extra.id
+  JOIN bin ON bin_extra.bin_id = bin.id
+  JOIN map_kegg ON bin_extra_kegg.kegg_id = map_kegg.kegg_id
+") %>%
+  dplyr::inner_join(pathways_info %>% dplyr::select(map_id), by = "map_id")
+
+pathways_per_bin <- ko_map_edges %>%
+  dplyr::distinct(sample_id, bin_name, map_id) %>%
+  dplyr::count(sample_id, bin_name, name = 'n_pathways') %>%
+  dplyr::left_join(samples, by = 'sample_id') %>%
+  dplyr::filter(!is.na(condition))
+
+pathways_per_sample <- pathways_per_bin %>%
+  dplyr::group_by(sample_id, condition, cow_id) %>%
+  dplyr::summarise(n_pathways = sum(n_pathways > 0), .groups = 'drop')
+```
+
+```{r cov-plot, fig.cap="Detected pathways — bin (left) and sample (right)"}
+p1 <- ggplot(pathways_per_bin, aes(factor(condition, levels=c('before','after')), n_pathways, fill=condition)) +
+  geom_boxplot(outlier.shape=NA, alpha=.85) + geom_jitter(width=.18, alpha=.6, size=1.8) +
+  scale_fill_manual(values=c(before='#91c3e6', after='#f4a582')) + labs(x="", y="Pathways per bin (≥1 KO)")
+p2 <- ggplot(pathways_per_sample, aes(factor(condition, levels=c('before','after')), n_pathways, fill=condition)) +
+  geom_boxplot(outlier.shape=NA, alpha=.85) + geom_jitter(width=.18, alpha=.6, size=2) +
+  scale_fill_manual(values=c(before='#91c3e6', after='#f4a582')) + labs(x="", y="Pathways per sample (sum of carrier bins)")
+gridExtra::grid.arrange(p1, p2, ncol=2)
+```
+
+```{r cov-tests}
+u2 <- stats::wilcox.test(n_pathways ~ condition, data = pathways_per_bin, exact = FALSE)
+p2 <- paired_wilcox(pathways_per_sample, "n_pathways")
+
+knitr::kable(tibble::tibble(
+  Metric = c("Pathways/bin","Pathways/sample"),
+  Test = c("Wilcoxon (unpaired)", ifelse(p2$paired_used,"Wilcoxon (paired)","Wilcoxon (unpaired)")),
+  W = c(as.numeric(u2$statistic), as.numeric(p2$test$statistic)),
+  p_value = c(nice_p(u2$p.value), nice_p(p2$test$p.value)),
+  Effect = c(round(cliffs_delta(pathways_per_bin$n_pathways[pathways_per_bin$condition=='before'],
+                                pathways_per_bin$n_pathways[pathways_per_bin$condition=='after'])$delta,3),
+             ifelse(p2$paired_used, round(p2$effect$r,3), NA)),
+  Magnitude = c(cliffs_delta(pathways_per_bin$n_pathways[pathways_per_bin$condition=='before'],
+                              pathways_per_bin$n_pathways[pathways_per_bin$condition=='after'])$magnitude,
+                ifelse(p2$paired_used, p2$effect$magnitude, "NA"))
+), caption="Couverture — tests (with effect sizes)")
+```
+
+# 3. Mean completeness (STRICT PANKEGG) + PCoA & PERMANOVA
+
+```{r comp}
+
+
+
+completeness_df <- dbGetQuery(con, "
+  SELECT bin.sample_id,
+         mk.map_id,
+         COUNT(DISTINCT mk.kegg_id) AS ko_off_detected
+  FROM bin_map_kegg AS bmk
+  JOIN bin         ON bmk.bin_id       = bin.id
+  JOIN map_kegg AS mk ON bmk.map_kegg_id = mk.id
+  GROUP BY bin.sample_id, mk.map_id
+")
+
+
+df_comp <- completeness_df %>%
+  dplyr::inner_join(pathways_info, by = "map_id") %>%
+  dplyr::mutate(completeness = ko_off_detected / pathway_total_orthologs) %>%
+  dplyr::left_join(samples, by = "sample_id") %>%
+  dplyr::filter(!is.na(condition))
+
+
+message(sprintf("df_comp: %d lignes, %d samples, %d pathways filtrés",
+                nrow(df_comp),
+                dplyr::n_distinct(df_comp$sample_name),
+                dplyr::n_distinct(df_comp$map_number)))
+
+
+mean_completion <- df_comp %>%
+  dplyr::group_by(sample_id, sample_name, condition, cow_id) %>%
+  dplyr::summarise(mean_compl = mean(completeness, na.rm = TRUE), .groups = 'drop')
+
+
+if (nrow(df_comp) > 0) {
+  mat_comp <- df_comp %>%
+    dplyr::group_by(sample_name, map_number) %>%
+    dplyr::summarise(value = mean(completeness, na.rm = TRUE), .groups = 'drop') %>%
+    tidyr::pivot_wider(names_from = map_number, values_from = value, values_fill = 0) %>%
+    as.data.frame()
+
+  rownames(mat_comp) <- mat_comp$sample_name
+  mat_comp$sample_name <- NULL
+
+  meta <- samples %>% dplyr::filter(sample_name %in% rownames(mat_comp))
+
+  if (nrow(mat_comp) >= 3) {
+    dist_bc <- vegan::vegdist(mat_comp, method = "bray")
+    pcoa <- cmdscale(dist_bc, eig = TRUE, k = 2)
+    scores <- as.data.frame(pcoa$points)
+    scores$sample_name <- rownames(scores)
+    scores <- dplyr::left_join(scores, meta, by = "sample_name")
+
+    ggplot(scores, aes(V1, V2, color=condition, label=sample_name)) +
+      geom_point(size=2.2) + ggrepel::geom_text_repel(show.legend=FALSE) +
+      scale_color_manual(values=c(before='#91c3e6', after='#f4a582')) +
+      labs(title='PCoA (Bray–Curtis) — pathway completeness', x='Axis 1', y='Axis 2')
+
+    set.seed(123)
+    permanova <- vegan::adonis2(dist_bc ~ condition, data = meta, strata = meta$cow_id, permutations = 999)
+    knitr::kable(as.data.frame(permanova), caption = "PERMANOVA (Bray–Curtis) with strata = cow_id")
+
+    bd <- vegan::betadisper(dist_bc, group = meta$condition)
+    bdp <- vegan::permutest(bd)
+    knitr::kable(as.data.frame(bdp$tab), caption = "Homogeneity of dispersions (betadisper)")
+  } else {
+    message(sprintf("No PCa, less than 3 samples", nrow(mat_comp)))
+  }
+} else {
+  message("No data.")
+}
+```
+
+```{r comp-plot, fig.cap="Mean completeness per sample (STRICT PANKEGG)"}
+ggplot(mean_completion, aes(factor(condition, levels=c('before','after')), mean_compl, fill=condition)) +
+  geom_boxplot(outlier.shape=NA, alpha=.85) + geom_jitter(width=.15, alpha=.7, size=2) +
+  scale_fill_manual(values=c(before='#91c3e6', after='#f4a582')) + labs(x="", y="Mean completeness (official KOs only)")
+```
+
+```{r comp-test}
+pw <- paired_wilcox(mean_completion, "mean_compl")
+knitr::kable(tibble::tibble(
+  Test = ifelse(pw$paired_used,"Wilcoxon (paired)","Wilcoxon (unpaired)"),
+  W = as.numeric(pw$test$statistic),
+  p_value = nice_p(pw$test$p.value),
+  Effect = ifelse(pw$paired_used, round(pw$effect$r,3), NA),
+  Magnitude = ifelse(pw$paired_used, pw$effect$magnitude, "NA")
+), caption="Mean completeness — test (with effect size)")
+```
+
+```{r pcoa}
+mat_comp <- df_comp %>%
+  dplyr::group_by(sample_name, map_number) %>%
+  dplyr::summarise(value = mean(completeness, na.rm = TRUE), .groups = 'drop') %>%
+  tidyr::pivot_wider(names_from = map_number, values_from = value, values_fill = 0) %>%
+  as.data.frame()
+rownames(mat_comp) <- mat_comp$sample_name
+mat_comp$sample_name <- NULL
+
+meta <- samples %>% dplyr::filter(sample_name %in% rownames(mat_comp))
+
+dist_bc <- vegan::vegdist(mat_comp, method = "bray")
+pcoa <- cmdscale(dist_bc, eig = TRUE, k = 2)
+scores <- as.data.frame(pcoa$points)
+scores$sample_name <- rownames(scores)
+scores <- dplyr::left_join(scores, meta, by = "sample_name")
+
+ggplot(scores, aes(V1, V2, color=condition, label=sample_name)) +
+  geom_point(size=2.2) + ggrepel::geom_text_repel(show.legend=FALSE) +
+  scale_color_manual(values=c(before='#91c3e6', after='#f4a582')) +
+  labs(title='PCoA (Bray–Curtis) — pathway completeness', x='Axis 1', y='Axis 2')
+```
+
+```{r adonis}
+set.seed(123)
+permanova <- vegan::adonis2(dist_bc ~ condition, data = meta, strata = meta$cow_id, permutations = 999)
+knitr::kable(as.data.frame(permanova), caption = "PERMANOVA (Bray–Curtis) with strata = cow_id")
+
+bd <- vegan::betadisper(dist_bc, group = meta$condition)
+bdp <- vegan::permutest(bd)
+knitr::kable(as.data.frame(bdp$tab), caption = "Homogeneity of dispersions (betadisper)")
+```
+
+# 4. Bin flexibility
+
+```{r flex}
+n_kos_per_bin <- dbGetQuery(con, "
+  SELECT bin.sample_id, bin.bin_name, COUNT(DISTINCT bin_extra_kegg.kegg_id) AS n_kos
+  FROM bin_extra_kegg
+  JOIN bin_extra ON bin_extra_kegg.extra_id = bin_extra.id
+  JOIN bin ON bin_extra.bin_id = bin.id
+  GROUP BY bin.sample_id, bin.bin_name
+")
+
+flexibility_df <- pathways_per_bin %>%
+  dplyr::select(sample_id, bin_name, n_pathways, condition) %>%
+  dplyr::inner_join(n_kos_per_bin, by = c('sample_id','bin_name'))
+
+ggplot(flexibility_df, aes(n_kos, n_pathways, color=condition)) +
+  geom_point(alpha=.6) + geom_smooth(method='lm', se=FALSE, color='black') +
+  scale_color_manual(values=c(before='#91c3e6', after='#f4a582')) +
+  labs(title='Functional flexibility of bins (selected maps)', x='KO richness (per bin)', y='Pathways per bin (≥1 KO)')
+```
+
+```{r flex-tests}
+wt <- stats::wilcox.test(n_pathways ~ condition, data = flexibility_df, exact = FALSE)
+cd <- cliffs_delta(flexibility_df$n_pathways[flexibility_df$condition=='before'],
+                   flexibility_df$n_pathways[flexibility_df$condition=='after'])
+knitr::kable(tibble::tibble(
+  Test = c("Wilcoxon (unpaired)"),
+  Stat = c(as.numeric(wt$statistic)),
+  p_value = c(nice_p(wt$p.value)),
+  Cliff_delta = round(cd$delta,3),
+  Magnitude = cd$magnitude
+), caption="Flexibility — tests")
+```
+
+# Session info & closing
+
+```{r session}
+sessionInfo()
+DBI::dbDisconnect(con)
+```

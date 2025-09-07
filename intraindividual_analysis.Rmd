@@ -1,0 +1,311 @@
+---
+title: "Part III  Intra-cow Functional Analysis "
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    fig_caption: true
+    self_contained: true
+    theme: readable
+    df_print: paged
+fontsize: 11pt
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE, fig.width = 7, fig.height = 4.8)
+```
+
+# Packages & connection
+
+```{r pkgs}
+req <- c("DBI","RSQLite","dplyr","tidyr","ggplot2","tibble","stringr","knitr","ggrepel")
+missing <- setdiff(req, rownames(installed.packages()))
+if (length(missing)) stop("Missing packages: ", paste(missing, collapse=", "))
+invisible(lapply(req, library, character.only = TRUE))
+```
+
+```{r connect}
+DB_PATH <- "rachel_test.db"
+if (!file.exists(DB_PATH)) stop("Database not found: ", DB_PATH)
+con <- DBI::dbConnect(RSQLite::SQLite(), DB_PATH)
+```
+
+# Utilities (paired tests, compact displays)
+
+```{r utils}
+cliffs_delta <- function(x, y){
+  x <- x[is.finite(x)]; y <- y[is.finite(y)]
+  nx <- length(x); ny <- length(y)
+  if (nx==0 || ny==0) return(list(delta=NA_real_, magnitude="NA"))
+  xy <- outer(x, y, function(a,b) sign(a-b))
+  delta <- sum(xy) / (nx*ny)
+  mag <- ifelse(abs(delta) < 0.147, "negligible",
+         ifelse(abs(delta) < 0.33,  "small",
+         ifelse(abs(delta) < 0.474, "medium", "large")))
+  list(delta=delta, magnitude=mag)
+}
+
+rank_biserial_paired <- function(before, after){
+  d <- after - before
+  d <- d[is.finite(d) & d != 0]
+  n_pos <- sum(d > 0); n_neg <- sum(d < 0)
+  if ((n_pos + n_neg) == 0) return(list(r=NA_real_, magnitude="NA"))
+  r <- (n_pos - n_neg) / (n_pos + n_neg)
+  mag <- ifelse(abs(r) < 0.147, "negligible",
+         ifelse(abs(r) < 0.33,  "small",
+         ifelse(abs(r) < 0.474, "medium", "large")))
+  list(r=r, magnitude=mag)
+}
+
+paired_wilcox <- function(df, value_col, condition_col="condition", id_col="cow_id"){
+
+  if (!all(c(condition_col, value_col, id_col) %in% names(df))) {
+    wt <- list(statistic = NA_real_, p.value = NA_real_)
+    eff <- list(r = NA_real_, magnitude = "NA")
+    return(list(test=wt, effect=eff, paired_used=FALSE, pairs=0L, wide=NULL))
+  }
+  d <- df %>%
+    dplyr::filter(.data[[condition_col]] %in% c("before","after")) %>%
+    dplyr::filter(!is.na(.data[[condition_col]]), !is.na(.data[[value_col]]), !is.na(.data[[id_col]]))
+  wide <- d %>%
+    dplyr::select(dplyr::all_of(c(id_col, condition_col, value_col))) %>%
+    tidyr::pivot_wider(names_from = dplyr::all_of(condition_col), values_from = dplyr::all_of(value_col)) %>%
+    dplyr::filter(!is.na(before), !is.na(after))
+  if (nrow(wide) >= 2) {
+    wt <- stats::wilcox.test(wide$before, wide$after, paired = TRUE, exact = FALSE)
+    eff <- rank_biserial_paired(wide$before, wide$after)
+    return(list(test=wt, effect=eff, paired_used=TRUE, pairs=nrow(wide), wide=wide))
+  }
+  wt <- list(statistic = NA_real_, p.value = NA_real_)
+  eff <- list(r = NA_real_, magnitude = "NA")
+  list(test=wt, effect=eff, paired_used=FALSE, pairs=0L, wide=NULL)
+}
+
+nice_p <- function(p) ifelse(is.na(p), "NA", formatC(p, format="e", digits=2))
+
+paired_table <- function(df, value_col){
+  df %>%
+    dplyr::select(cow_id, condition, value = .data[[value_col]]) %>%
+    tidyr::pivot_wider(names_from = condition, values_from = value) %>%
+    dplyr::mutate(
+      delta = after - before,
+      pct_change = 100*(after - before)/before
+    ) %>%
+    dplyr::arrange(cow_id)
+}
+
+slope_plot <- function(wide_df, ylab){
+  long <- wide_df %>%
+    dplyr::select(cow_id, before, after) %>%
+    tidyr::pivot_longer(-cow_id, names_to="condition", values_to="value") %>%
+    dplyr::mutate(condition = factor(condition, levels=c("before","after")))
+  ggplot(long, aes(condition, value, group=cow_id)) +
+    geom_line(alpha=.6) +
+    geom_point(size=2, aes(color=condition)) +
+    scale_color_manual(values=c(before='#91c3e6', after='#f4a582')) +
+    facet_wrap(~cow_id, ncol=3, scales="free_y") +
+    labs(x="", y=ylab)
+}
+```
+
+# Metadata & pathway selection
+
+```{r meta}
+samples <- dbGetQuery(con, "SELECT id AS sample_id, sample_name FROM sample") %>%
+  dplyr::mutate(
+    condition = dplyr::case_when(
+      sample_name %in% paste0("A", 13:18) ~ "before",
+      sample_name %in% paste0("A", 19:24) ~ "after",
+      TRUE ~ NA_character_
+    ),
+    cow_id = dplyr::case_when(
+      sample_name %in% c("A13","A19") ~ "v1",
+      sample_name %in% c("A14","A20") ~ "v2",
+      sample_name %in% c("A15","A21") ~ "v3",
+      sample_name %in% c("A16","A22") ~ "v4",
+      sample_name %in% c("A17","A23") ~ "v5",
+      sample_name %in% c("A18","A24") ~ "v6",
+      TRUE ~ NA_character_
+    )
+  )
+stopifnot(all(na.omit(samples$condition) %in% c("before","after")))
+```
+
+```{r maps-filter}
+
+selected_maps <- c(
+
+  "00010","00020","00030","00040",
+  "00051","00052","00500","00520",
+  "00562","00563",
+
+  "00620","00630","00640","00650",
+
+  "00660","00680","00720",
+
+  "00910","00920",
+
+  "00061","00071","00072","00561","00564",
+  "01040","01053",
+
+  "00220","00250","00260","00270","00280","00310",
+  "00330","00340","00350",
+
+  "00230","00240","00740","00750",
+  "00760","00770","00780",
+
+  "00130","00140",
+
+  "02010","02060","03070"
+)
+
+
+pathways_info <- dbGetQuery(con, "
+  SELECT id AS map_id, map_number, pathway_total_orthologs
+  FROM map
+  WHERE pathway_total_orthologs IS NOT NULL
+") %>%
+  dplyr::filter(pathway_total_orthologs > 0) %>%
+  dplyr::mutate(
+    map_number = gsub('^map', '', as.character(map_number), ignore.case = TRUE),
+    map_number = stringr::str_pad(map_number, width = 5, pad = '0')
+  ) %>%
+  dplyr::filter(map_number %in% selected_maps)
+```
+
+# 1) KO richness — **intra-cow** at the sample level (paired)
+
+```{r ko}
+ko_edges <- dbGetQuery(con, "
+  SELECT bin.sample_id, bin.bin_name, bin_extra_kegg.kegg_id
+  FROM bin_extra_kegg
+  JOIN bin_extra ON bin_extra_kegg.extra_id = bin_extra.id
+  JOIN bin ON bin_extra.bin_id = bin.id
+")
+
+ko_richness_sample <- ko_edges %>%
+  dplyr::distinct(sample_id, kegg_id) %>%
+  dplyr::count(sample_id, name = 'n_unique_kos') %>%
+  dplyr::left_join(samples, by = 'sample_id') %>%
+  dplyr::filter(!is.na(condition), !is.na(cow_id))
+
+
+ko_tab_cow <- paired_table(ko_richness_sample, "n_unique_kos")
+knitr::kable(ko_tab_cow, digits=2, caption="KO richness (unique KOs per sample) — cow-level summary (before, after, Δ, % change)")
+
+
+slope_plot(ko_tab_cow, "Unique KOs per sample")
+
+
+ggplot(ko_richness_sample, aes(factor(condition, levels=c('before','after')), n_unique_kos, fill=condition)) +
+  geom_boxplot(outlier.shape=NA, alpha=.85) + geom_jitter(width=.15, alpha=.6, size=2) +
+  scale_fill_manual(values=c(before='#91c3e6', after='#f4a582')) +
+  labs(x="", y="Unique KOs per sample", title="KO richness — paired design (summarized across cows)")
+
+
+ko_test <- paired_wilcox(ko_richness_sample, "n_unique_kos")
+knitr::kable(tibble::tibble(
+  Test = ifelse(ko_test$paired_used,"Paired Wilcoxon","Paired Wilcoxon (insufficient pairs)"),
+  Pairs = ko_test$pairs,
+  W = as.numeric(ko_test$test$statistic),
+  p_value = nice_p(ko_test$test$p.value),
+  Effect_r = ifelse(ko_test$paired_used, round(ko_test$effect$r,3), NA),
+  Magnitude = ifelse(ko_test$paired_used, ko_test$effect$magnitude, "NA")
+), caption="KO richness — paired test & effect size")
+```
+
+# 2) Mean pathway completeness (STRICT PANKEGG) — **intra-cow** at the sample level (paired)
+
+**Definition used here (PANKEGG-style):** For each sample × KEGG map, we count only *official* KEGG Orthologs (KOs) that belong to that map in KEGG (`map_kegg.id`), i.e. via the `bin_map_kegg → map_kegg` relationship. Completeness = *\# official KOs detected* / *\# official KOs in the map (`pathway_total_orthologs`)*. We then average completeness across the selected rumen-relevant maps for each sample.
+
+```{r comp_strict}
+
+completeness_df <- dbGetQuery(con, "
+  SELECT bin.sample_id,
+         mk.map_id,
+         COUNT(DISTINCT mk.kegg_id) AS ko_off_detected
+  FROM bin_map_kegg AS bmk
+  JOIN bin         ON bmk.bin_id        = bin.id
+  JOIN map_kegg AS mk ON bmk.map_kegg_id  = mk.id
+  GROUP BY bin.sample_id, mk.map_id
+")
+
+df_comp <- completeness_df %>%
+  dplyr::inner_join(pathways_info, by = "map_id") %>%
+  dplyr::mutate(completeness = ko_off_detected / pathway_total_orthologs) %>%
+  dplyr::left_join(samples, by = "sample_id") %>%
+  dplyr::filter(!is.na(condition), !is.na(cow_id))
+
+
+mean_completion <- df_comp %>%
+  dplyr::group_by(sample_id, sample_name, condition, cow_id) %>%
+  dplyr::summarise(mean_compl = mean(completeness, na.rm = TRUE), .groups = 'drop')
+
+
+comp_tab_cow <- paired_table(mean_completion, "mean_compl")
+knitr::kable(comp_tab_cow %>% dplyr::mutate(across(where(is.numeric), ~round(., 4))),
+             caption="Mean pathway completeness (official KOs only) — cow-level summary")
+
+slope_plot(comp_tab_cow, "Mean completeness (official KOs only)")
+
+
+
+ggplot(mean_completion, aes(factor(condition, levels=c('before','after')), mean_compl, fill=condition)) +
+  geom_boxplot(outlier.shape=NA, alpha=.85) + geom_jitter(width=.15, alpha=.7, size=2) +
+  scale_fill_manual(values=c(before='#91c3e6', after='#f4a582')) +
+  labs(x="", y="Mean completeness (official KOs only)",
+       title="Mean pathway completeness — paired design (summarized across cows)")
+
+
+comp_test <- paired_wilcox(mean_completion, "mean_compl")
+knitr::kable(tibble::tibble(
+  Test = ifelse(comp_test$paired_used,"Paired Wilcoxon","Paired Wilcoxon (insufficient pairs)"),
+  Pairs = comp_test$pairs,
+  W = as.numeric(comp_test$test$statistic),
+  p_value = nice_p(comp_test$test$p.value),
+  Effect_r = ifelse(comp_test$paired_used, round(comp_test$effect$r,3), NA),
+  Magnitude = ifelse(comp_test$paired_used, comp_test$effect$magnitude, "NA")
+), caption="Mean pathway completeness — paired test & effect size")
+```
+
+# 3) Per-cow Bray–Curtis distance (before → after) on completeness profiles
+
+This describes the *within-cow shift* across the whole set of selected maps. For each cow, we form the vector of official completeness values (one per KEGG map) and compute Bray–Curtis distance between her before and after samples. 0 means identical profiles; values closer to 1 indicate stronger reconfiguration across maps.
+
+```{r bray}
+
+mat_comp <- df_comp %>%
+  dplyr::group_by(sample_id, sample_name, cow_id, condition, map_number) %>%
+  dplyr::summarise(value = mean(completeness, na.rm = TRUE), .groups = 'drop') %>%
+  tidyr::pivot_wider(names_from = map_number, values_from = value, values_fill = 0)
+
+
+bray_by_cow <- mat_comp %>%
+  dplyr::select(cow_id, condition, dplyr::matches('^\\d{5}$')) %>%
+  dplyr::group_by(cow_id) %>%
+  dplyr::group_modify(~{
+    if (!all(c("before","after") %in% .x$condition)) return(tibble::tibble(bray=NA_real_))
+    B <- as.numeric(.x %>% dplyr::filter(condition=="before") %>% dplyr::select(-condition) %>% as.matrix())
+    A <- as.numeric(.x %>% dplyr::filter(condition=="after")  %>% dplyr::select(-condition) %>% as.matrix())
+    bc <- sum(abs(B - A)) / pmax(sum(B + A), .Machine$double.eps)
+    tibble::tibble(bray = bc)
+  }) %>% dplyr::ungroup()
+
+knitr::kable(bray_by_cow, digits=3, caption="Bray–Curtis distance by cow (0 = identical, 1 = disjoint)")
+
+ggplot(bray_by_cow, aes(x=cow_id, y=bray)) +
+  geom_col(alpha=.85) +
+  geom_text(aes(label=sprintf('%.2f', bray)), vjust=-0.4, size=3) +
+  ylim(0, max(1, max(bray_by_cow$bray, na.rm = TRUE) + 0.1)) +
+  labs(x="Cow", y="Bray–Curtis (before → after)",
+       title="Within-cow shift in completeness profiles (official KOs only)")
+```
+
+# Session info & close
+
+```{r session}
+sessionInfo()
+DBI::dbDisconnect(con)
+```

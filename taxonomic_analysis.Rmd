@@ -1,0 +1,508 @@
+---
+title: "Part I Taxonomic Analysis "
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    fig_caption: true
+    self_contained: true
+    theme: readable
+    df_print: paged
+fontsize: 11pt
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE, fig.width = 7, fig.height = 4.8)
+library(ggplot2)
+theme_set(theme_minimal())
+```
+
+# Packages & connection
+
+```{r pkgs}
+req <- c("DBI","RSQLite","dplyr","tidyr","ggplot2","tibble","stringr","readr","gridExtra","ggrepel","purrr")
+missing <- setdiff(req, rownames(installed.packages()))
+if (length(missing)) stop("Missing packages: ", paste(missing, collapse=", "))
+invisible(lapply(req, library, character.only = TRUE))
+
+DB_PATH <- "rachel_test.db"
+if (!file.exists(DB_PATH)) stop("Database not found: ", DB_PATH)
+con <- DBI::dbConnect(RSQLite::SQLite(), DB_PATH)
+```
+
+# Utilities
+
+```{r utils}
+nice_p <- function(p) ifelse(is.na(p), "NA", formatC(p, format="e", digits=2))
+
+harmonize_label <- function(x){
+
+  x <- gsub("^\\(?[Cc]andidatus\\)?\\s+","", x, perl = TRUE)
+
+  x <- gsub("^g__|^p__|^c__|^o__|^f__|^s__","", x, perl = TRUE)
+  x <- trimws(x)
+  x[x=="" | is.na(x)] <- "Unassigned"
+  x
+}
+
+to_gtdb_phylum <- function(x){
+  m <- c(
+    "Firmicutes_A"="Bacillota","Firmicutes"="Bacillota","Bacillota_A"="Bacillota",
+    "Bacteroidetes"="Bacteroidota",
+    "Proteobacteria"="Pseudomonadota",
+    "Epsilonbacteraeota"="Campylobacterota",
+    "Actinobacteria"="Actinomycetota",
+    "Spirochaetes"="Spirochaetota",
+    "Tenericutes"="Mycoplasmatota"
+  )
+  dplyr::recode(x, !!!m, .default = x)
+}
+
+force_ba <- function(df){
+  df %>% dplyr::mutate(condition = factor(condition, levels = c("before","after")))
+}
+```
+
+# Metadata
+
+```{r meta}
+samples <- dbGetQuery(con, "SELECT id AS sample_id, sample_name FROM sample") %>%
+  dplyr::mutate(
+    condition = dplyr::case_when(
+      sample_name %in% paste0("A", 13:18) ~ "before",
+      sample_name %in% paste0("A", 19:24) ~ "after",
+      TRUE ~ NA_character_
+    ),
+    cow_id = dplyr::case_when(
+      sample_name %in% c("A13","A19") ~ "1",
+      sample_name %in% c("A14","A20") ~ "2",
+      sample_name %in% c("A15","A21") ~ "3",
+      sample_name %in% c("A16","A22") ~ "4",
+      sample_name %in% c("A17","A23") ~ "5",
+      sample_name %in% c("A18","A24") ~ "6",
+      TRUE ~ NA_character_
+    )
+  ) %>% force_ba()
+```
+
+# Kraken2 (≥5k reads) — import & normalization (fractions)
+
+```{r kraken}
+kreport_dir <- "/home/rachel/kreport"
+MIN_READS   <- 5000
+rank_letter_phylum <- "P"
+rank_letter_genus  <- "G"
+
+if (!dir.exists(kreport_dir)) stop("kreport directory not found: ", kreport_dir)
+kfiles <- list.files(kreport_dir, pattern = "kreport", full.names = TRUE, recursive = TRUE)
+if (length(kfiles)==0) stop("No kreport files found in: ", kreport_dir)
+
+read_kreport_rank <- function(path, rank_letter, min_reads = MIN_READS){
+  cols <- readr::cols(
+    pct = readr::col_double(),
+    reads_clade = readr::col_double(),
+    reads_taxon = readr::col_double(),
+    rank = readr::col_character(),
+    taxid = readr::col_character(),
+    name = readr::col_character()
+  )
+  df <- tryCatch(
+    readr::read_tsv(path, col_names = c("pct","reads_clade","reads_taxon","rank","taxid","name"),
+                    col_types = cols, comment = "#", progress = FALSE, trim_ws = TRUE),
+    error = function(e) readr::read_tsv(path, col_types = readr::cols(.default = readr::col_character()),
+                                        comment = "#", progress = FALSE, trim_ws = TRUE)
+  )
+  if (!all(c("reads_clade","rank","name") %in% names(df))) {
+    stop("Unexpected kreport format for: ", basename(path))
+  }
+  df$name <- harmonize_label(df$name)
+  df$reads_clade <- suppressWarnings(as.numeric(df$reads_clade))
+  df <- df[is.finite(df$reads_clade), ]
+  out <- df %>%
+    dplyr::filter(rank == rank_letter, reads_clade >= min_reads) %>%
+    dplyr::group_by(taxon = name) %>%
+    dplyr::summarise(reads = sum(reads_clade), .groups="drop")
+  if (!nrow(out)) return(tibble::tibble(taxon=character(0), rel=numeric(0)))
+  out %>% dplyr::mutate(rel = reads / sum(reads))
+}
+
+infer_sample_from_filename <- function(file, sample_names){
+  bn <- basename(file)
+  cand <- sample_names[stringr::str_detect(bn, stringr::fixed(sample_names))]
+  if (!length(cand)) return(NA_character_)
+  cand[which.max(nchar(cand))]
+}
+
+
+kr_list_P <- lapply(kfiles, function(f){
+  sn <- infer_sample_from_filename(f, samples$sample_name); if (is.na(sn)) return(NULL)
+  df <- read_kreport_rank(f, rank_letter_phylum, MIN_READS); df$sample_name <- sn; df
+})
+kraken_P <- dplyr::bind_rows(kr_list_P) %>%
+  dplyr::left_join(samples, by="sample_name") %>%
+  dplyr::filter(!is.na(condition)) %>%
+  force_ba() %>%
+  dplyr::mutate(taxon = to_gtdb_phylum(taxon)) %>%
+  dplyr::group_by(sample_id, sample_name, condition, cow_id, taxon) %>%
+  dplyr::summarise(rel=sum(rel), .groups="drop") %>%
+  dplyr::group_by(sample_id) %>% dplyr::mutate(rel = rel / sum(rel)) %>% dplyr::ungroup()
+
+
+kr_list_G <- lapply(kfiles, function(f){
+  sn <- infer_sample_from_filename(f, samples$sample_name); if (is.na(sn)) return(NULL)
+  df <- read_kreport_rank(f, rank_letter_genus, MIN_READS); df$sample_name <- sn; df
+})
+kraken_G <- dplyr::bind_rows(kr_list_G) %>%
+  dplyr::left_join(samples, by="sample_name") %>%
+  dplyr::filter(!is.na(condition)) %>%
+  force_ba() %>%
+  dplyr::group_by(sample_id, sample_name, condition, cow_id, taxon) %>%
+  dplyr::summarise(rel=sum(rel), .groups="drop") %>%
+  dplyr::group_by(sample_id) %>% dplyr::mutate(rel = rel / sum(rel)) %>% dplyr::ungroup()
+```
+
+# Bins → Taxonomy & prevalence (fractions of bins per sample)
+
+```{r bins}
+
+bin_taxo <- dbGetQuery(con, "
+  SELECT bin.sample_id, bin.bin_name,
+         taxonomy._phylum_ AS phylum,
+         taxonomy._genus_  AS genus
+  FROM bin
+  LEFT JOIN taxonomy ON bin.taxonomic_id = taxonomy.id
+")
+
+bin_lineage <- bin_taxo %>%
+  dplyr::left_join(samples, by = "sample_id") %>%
+  dplyr::filter(!is.na(condition)) %>%
+  force_ba() %>%
+  dplyr::mutate(
+    phylum = harmonize_label(phylum),
+    genus  = harmonize_label(genus)
+  )
+
+
+bins_prev_P <- bin_lineage %>%
+  dplyr::mutate(taxon = to_gtdb_phylum(phylum)) %>%
+  dplyr::group_by(sample_id, sample_name, condition, cow_id) %>%
+  dplyr::mutate(n_tot = dplyr::n_distinct(bin_name)) %>%
+  dplyr::group_by(sample_id, sample_name, condition, cow_id, taxon, n_tot) %>%
+  dplyr::summarise(n = dplyr::n_distinct(bin_name), .groups="drop") %>%
+  dplyr::mutate(rel = ifelse(n_tot>0, n/n_tot, NA_real_))
+
+bins_prev_G <- bin_lineage %>%
+  dplyr::group_by(sample_id, sample_name, condition, cow_id) %>%
+  dplyr::mutate(n_tot = dplyr::n_distinct(bin_name)) %>%
+  dplyr::group_by(sample_id, sample_name, condition, cow_id, taxon=genus, n_tot) %>%
+  dplyr::summarise(n = dplyr::n_distinct(bin_name), .groups="drop") %>%
+  dplyr::mutate(rel = ifelse(n_tot>0, n/n_tot, NA_real_))
+```
+
+# Bacteria — Phylum overview (Reads vs Bin prevalence)
+
+```{r overview-phylum, fig.cap="Bacteria — Phylum fractions (Before/After). Left: reads; Right: bin prevalence. Colors are consistent across panels. Small taxa (< MIN_FRAC) are grouped as 'Other' using a union across sources."}
+
+archaea_phyla <- c(
+  "Euryarchaeota","Thermoplasmatota","Methanobacteriota","Halobacteriota",
+  "Crenarchaeota","Thaumarchaeota","Nanoarchaeota","Micrarchaeota",
+  "Woesearchaeota","Altiarchaeota","Korarchaeota","Aenigmarchaeota"
+)
+
+MIN_FRAC <- 0.01
+
+
+comp_P <- dplyr::bind_rows(
+  kraken_P %>% dplyr::mutate(source="reads"),
+  bins_prev_P %>% dplyr::mutate(source="bins_prev")
+) %>% dplyr::filter(!(taxon %in% archaea_phyla))
+
+
+keep_tbl <- comp_P %>%
+  dplyr::group_by(source, taxon) %>%
+  dplyr::summarise(mean_rel = mean(rel, na.rm=TRUE), .groups="drop") %>%
+  tidyr::pivot_wider(names_from=source, values_from=mean_rel, values_fill=0) %>%
+  dplyr::mutate(keep = (reads >= MIN_FRAC) | (bins_prev >= MIN_FRAC))
+
+keep_taxa <- keep_tbl$taxon[keep_tbl$keep]
+
+plot_P_bact <- comp_P %>%
+  dplyr::mutate(taxon2 = ifelse(taxon %in% keep_taxa, taxon, "Other")) %>%
+  dplyr::group_by(source, condition, taxon2) %>%
+  dplyr::summarise(mean_rel = mean(rel, na.rm=TRUE), .groups="drop") %>%
+  force_ba()
+
+
+all_keys <- sort(unique(plot_P_bact$taxon2))
+all_keys <- c(setdiff(all_keys, "Other"), "Other")
+col_vec <- grDevices::hcl.colors(length(all_keys)-1, "Dark 3")
+col_vec <- c(col_vec, "#cccccc")
+names(col_vec) <- all_keys
+
+p_reads <- ggplot(plot_P_bact %>% dplyr::filter(source=="reads"),
+                  aes(condition, mean_rel, fill=taxon2)) +
+  geom_col(position="fill") +
+  labs(x="", y="fraction") + ggtitle("Reads (Kraken ≥5k)") +
+  scale_x_discrete(limits=c("before","after")) +
+  scale_fill_manual(values = col_vec, drop = FALSE)
+
+p_bins  <- ggplot(plot_P_bact %>% dplyr::filter(source=="bins_prev"),
+                  aes(condition, mean_rel, fill=taxon2)) +
+  geom_col(position="fill") +
+  labs(x="", y="fraction") + ggtitle("Bins (prevalence)") +
+  scale_x_discrete(limits=c("before","after")) +
+  scale_fill_manual(values = col_vec, drop = FALSE)
+
+gridExtra::grid.arrange(p_reads, p_bins, ncol=2)
+```
+
+# Archaea — Genus overview (Reads vs Bin prevalence)
+
+```{r arch-genus, fig.cap="Archaea — Genus fractions (Before/After). Left: reads; Right: bin prevalence. Small taxa (< MIN_FRAC) grouped as 'Other' using a union across sources."}
+
+methanogen_genera <- c("Methanobrevibacter","Methanomicrobium","Methanobacterium","Methanoculleus",
+                       "Methanosphaera","Methanomassiliicoccus","Methanomethylophilus",
+                       "Methanosarcina","Methanothrix","Methanosaeta")
+
+arch_genus_from_bins <- bin_lineage %>%
+  dplyr::filter(phylum %in% archaea_phyla) %>%
+  dplyr::pull(genus) %>% unique() %>% na.omit() %>% as.character()
+
+arch_genus <- sort(unique(c(arch_genus_from_bins, methanogen_genera)))
+
+comp_arch_G <- dplyr::bind_rows(
+  kraken_G    %>% dplyr::filter(taxon %in% arch_genus) %>% dplyr::mutate(source="reads"),
+  bins_prev_G %>% dplyr::filter(taxon %in% arch_genus) %>% dplyr::mutate(source="bins_prev")
+)
+
+MIN_FRAC <- 0.01
+keep_tbl_g <- comp_arch_G %>%
+  dplyr::group_by(source, taxon) %>%
+  dplyr::summarise(mean_rel = mean(rel, na.rm=TRUE), .groups="drop") %>%
+  tidyr::pivot_wider(names_from=source, values_from=mean_rel, values_fill=0) %>%
+  dplyr::mutate(keep = (reads >= MIN_FRAC) | (bins_prev >= MIN_FRAC))
+keep_genus <- keep_tbl_g$taxon[keep_tbl_g$keep]
+
+plot_G_arch <- comp_arch_G %>%
+  dplyr::mutate(taxon2 = ifelse(taxon %in% keep_genus, taxon, "Other")) %>%
+  dplyr::group_by(source, condition, taxon2) %>%
+  dplyr::summarise(mean_rel = mean(rel, na.rm=TRUE), .groups="drop") %>%
+  force_ba()
+
+
+all_g_keys <- sort(unique(plot_G_arch$taxon2))
+all_g_keys <- c(setdiff(all_g_keys, "Other"), "Other")
+col_gen <- grDevices::hcl.colors(length(all_g_keys)-1, "Dark 3")
+col_gen <- c(col_gen, "#cccccc"); names(col_gen) = all_g_keys
+
+p_reads_g <- ggplot(plot_G_arch %>% dplyr::filter(source=="reads"),
+                    aes(condition, mean_rel, fill=taxon2)) +
+  geom_col(position="fill") + labs(x="", y="fraction") + ggtitle("Reads (Kraken ≥5k)") +
+  scale_x_discrete(limits=c("before","after")) +
+  scale_fill_manual(values = col_gen, drop = FALSE)
+
+p_bins_g  <- ggplot(plot_G_arch %>% dplyr::filter(source=="bins_prev"),
+                    aes(condition, mean_rel, fill=taxon2)) +
+  geom_col(position="fill") + labs(x="", y="fraction") + ggtitle("Bins (prevalence)") +
+  scale_x_discrete(limits=c("before","after")) +
+  scale_fill_manual(values = col_gen, drop = FALSE)
+
+gridExtra::grid.arrange(p_reads_g, p_bins_g, ncol=2)
+```
+
+# (Optional) Per-cow facets
+
+```{r per-cow, eval=TRUE, fig.cap="Per-cow view. Left: reads; Right: bin prevalence."}
+
+plot_P_bact_cow <- comp_P %>%
+  dplyr::mutate(taxon2 = ifelse(taxon %in% keep_taxa, taxon, "Other")) %>%
+  dplyr::group_by(source, cow_id, condition, taxon2) %>%
+  dplyr::summarise(mean_rel = mean(rel, na.rm=TRUE), .groups="drop") %>%
+  force_ba()
+
+p_reads_cow <- ggplot(plot_P_bact_cow %>% dplyr::filter(source=="reads"),
+                      aes(condition, mean_rel, fill=taxon2)) +
+  geom_col(position="fill") + labs(x="", y="fraction") + ggtitle("Bacteria / Phylum — Reads") +
+  facet_wrap(~cow_id, ncol=3) +
+  scale_x_discrete(limits=c("before","after")) +
+  scale_fill_manual(values = col_vec, drop = FALSE)
+
+p_bins_cow  <- ggplot(plot_P_bact_cow %>% dplyr::filter(source=="bins_prev"),
+                      aes(condition, mean_rel, fill=taxon2)) +
+  geom_col(position="fill") + labs(x="", y="fraction") + ggtitle("Bacteria / Phylum — Bins") +
+  facet_wrap(~cow_id, ncol=3) +
+  scale_x_discrete(limits=c("before","after")) +
+  scale_fill_manual(values = col_vec, drop = FALSE)
+
+gridExtra::grid.arrange(p_reads_cow, p_bins_cow, ncol=2)
+
+
+plot_G_arch_cow <- comp_arch_G %>%
+  dplyr::mutate(taxon2 = ifelse(taxon %in% keep_genus, taxon, "Other")) %>%
+  dplyr::group_by(source, cow_id, condition, taxon2) %>%
+  dplyr::summarise(mean_rel = mean(rel, na.rm=TRUE), .groups="drop") %>%
+  force_ba()
+
+p_reads_g_cow <- ggplot(plot_G_arch_cow %>% dplyr::filter(source=="reads"),
+                        aes(condition, mean_rel, fill=taxon2)) +
+  geom_col(position="fill") + labs(x="", y="fraction") + ggtitle("Archaea / Genus — Reads") +
+  facet_wrap(~cow_id, ncol=3) +
+  scale_x_discrete(limits=c("before","after")) +
+  scale_fill_manual(values = col_gen, drop = FALSE)
+
+p_bins_g_cow  <- ggplot(plot_G_arch_cow %>% dplyr::filter(source=="bins_prev"),
+                        aes(condition, mean_rel, fill=taxon2)) +
+  geom_col(position="fill") + labs(x="", y="fraction") + ggtitle("Archaea / Genus — Bins") +
+  facet_wrap(~cow_id, ncol=3) +
+  scale_x_discrete(limits=c("before","after")) +
+  scale_fill_manual(values = col_gen, drop = FALSE)
+
+gridExtra::grid.arrange(p_reads_g_cow, p_bins_g_cow, ncol=2)
+
+
+
+
+interest_genera <- c(
+  "Ruminococcus",
+  "Fibrobacter",
+  "Prevotella",
+  "Selenomonas",
+  "Megasphaera",
+  "Butyrivibrio"
+)
+
+
+
+cow_genus_frac <- bins_prev_G %>%
+  dplyr::filter(taxon %in% interest_genera) %>%
+  dplyr::group_by(cow_id, condition, taxon) %>%
+  dplyr::summarise(frac = mean(rel, na.rm = TRUE), .groups = "drop") %>%
+  tidyr::complete(cow_id, condition, taxon = interest_genera, fill = list(frac = 0)) %>%
+  dplyr::filter(!is.na(cow_id), !is.na(condition)) %>%
+  force_ba()
+
+
+genus_wide <- cow_genus_frac %>%
+  tidyr::pivot_wider(names_from = condition, values_from = frac, values_fill = 0) %>%
+  dplyr::mutate(
+    delta = after - before,
+    pct_change = dplyr::if_else(before > 0, 100 * (after - before) / before, NA_real_)
+  )
+
+
+trend_summary <- genus_wide %>%
+  dplyr::group_by(taxon) %>%
+  dplyr::summarise(
+    mean_delta = mean(delta, na.rm = TRUE),
+    median_pct = stats::median(pct_change, na.rm = TRUE),
+    n_pairs = dplyr::n(),
+    .groups = "drop"
+  )
+
+
+library(ggplot2)
+p_trend <- ggplot(trend_summary, aes(x = reorder(taxon, mean_delta), y = mean_delta)) +
+  geom_hline(yintercept = 0, linewidth = 0.4, colour = "grey50") +
+  geom_col(width = 0.7, alpha = 0.9) +
+
+  geom_point(data = genus_wide,
+             aes(x = taxon, y = delta), position = position_jitter(width = 0.1, height = 0),
+             size = 2, alpha = 0.6, inherit.aes = FALSE) +
+  coord_flip() +
+  labs(
+    title = "Bins (genus) — trend per target genus",
+    subtitle = "Δ fraction of bins (after − before); dots = cows",
+    x = "", y = "Δ (fraction of bins)"
+  )
+
+
+comp_interest <- cow_genus_frac %>%
+  dplyr::group_by(condition, taxon) %>%
+  dplyr::summarise(mean_frac = mean(frac, na.rm = TRUE), .groups = "drop") %>%
+  force_ba()
+
+p_stack <- ggplot(comp_interest, aes(x = condition, y = mean_frac, fill = taxon)) +
+  geom_col(position = "stack", alpha = 0.95) +
+  scale_x_discrete(limits = c("before","after")) +
+  labs(
+    title = "Bins (genus) — fibre degraders & VFA producers",
+    subtitle = "Stacked = fraction of bins (averaged over cows)",
+    x = "", y = "Fraction of bins"
+  ) +
+  theme(legend.title = element_blank())
+
+
+gridExtra::grid.arrange(p_trend, p_stack, ncol = 2)
+
+
+interest_genera <- c(
+  "Ruminococcus","Fibrobacter",
+  "Prevotella","Selenomonas","Megasphaera","Butyrivibrio"
+)
+
+
+cow_genus_frac <- bins_prev_G %>%
+  dplyr::filter(taxon %in% interest_genera) %>%
+  dplyr::group_by(cow_id, condition, taxon) %>%
+  dplyr::summarise(frac = mean(rel, na.rm = TRUE), .groups = "drop") %>%
+  tidyr::complete(cow_id, condition, taxon = interest_genera, fill = list(frac = 0)) %>%
+  dplyr::filter(!is.na(cow_id), !is.na(condition)) %>%
+  force_ba()
+
+
+reads_cow_genus <- kraken_G %>%
+  dplyr::filter(taxon %in% interest_genera) %>%
+  dplyr::group_by(cow_id, condition, taxon) %>%
+  dplyr::summarise(frac = mean(rel, na.rm = TRUE), .groups = "drop") %>%
+  tidyr::complete(cow_id, condition, taxon = interest_genera, fill = list(frac = 0)) %>%
+  dplyr::filter(!is.na(cow_id), !is.na(condition)) %>%
+  force_ba()
+
+
+normalize_within_interest <- FALSE
+if (normalize_within_interest) {
+  reads_cow_genus <- reads_cow_genus %>%
+  dplyr::group_by(cow_id, condition) %>%
+  dplyr::mutate(frac = ifelse(sum(frac)>0, frac/sum(frac), 0)) %>%
+  dplyr::ungroup()
+  cow_genus_frac <- cow_genus_frac %>%
+  dplyr::group_by(cow_id, condition) %>%
+  dplyr::mutate(frac = ifelse(sum(frac)>0, frac/sum(frac), 0)) %>%
+  dplyr::ungroup()
+}
+
+
+p_reads_cow <- ggplot(reads_cow_genus,
+                      aes(x = condition, y = frac, fill = taxon)) +
+  geom_col(alpha = 0.95) +
+  scale_x_discrete(limits = c("before","after")) +
+  facet_wrap(~cow_id, ncol = 3) +
+  labs(title = "Target genera — READS",
+       subtitle = if (normalize_within_interest) "Normalized within interest set" else "Raw fraction within sample",
+       x = "", y = "Fraction") +
+  theme(legend.position = "bottom", legend.title = element_blank())
+
+
+p_bins_cow <- ggplot(cow_genus_frac,
+                     aes(x = condition, y = frac, fill = taxon)) +
+  geom_col(alpha = 0.95) +
+  scale_x_discrete(limits = c("before","after")) +
+  facet_wrap(~cow_id, ncol = 3) +
+  labs(title = "Target genera — BINS (prevalence)",
+       subtitle = if (normalize_within_interest) "Normalized within interest set" else "Raw fraction within sample",
+       x = "", y = "Fraction of bins") +
+  theme(legend.position = "bottom", legend.title = element_blank())
+
+gridExtra::grid.arrange(p_reads_cow, p_bins_cow, ncol = 2,
+                        top = "Per-cow view. Left: reads; Right: bin prevalence.")
+
+```
+
+# Session info & disconnect
+
+```{r session}
+sessionInfo()
+DBI::dbDisconnect(con)
+```
